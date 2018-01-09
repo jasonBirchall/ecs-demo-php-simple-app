@@ -1,0 +1,86 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: LAA Java-based application stack that deploys on top of UK OFFICIAL derived infrastructure template
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 20171214
+  Identifier:
+    Value: app-main
+  Input:
+    Description: Input of all required parameters in nested stacks
+  Output:
+    Description: N/A
+Parameters:
+  pAppName:
+    Description: Application name with application instance identifier,
+      e.g. "CCR1" to accommodate multiple instances of the same stack under the same infrastructure
+    Type: String
+    Default: CCR1
+    AllowedPattern: '^[a-zA-Z][0-9a-zA-Z-]+$'
+  pECSRepositoryURL:
+    Description: ECR repository URL of docker images
+    Type: String
+    Default: '902837325998.dkr.ecr.eu-west-2.amazonaws.com/laa-app'
+  pDockerImageTag:
+    Description: The docker image tag to be used by ECS cluster
+    Type: String
+    Default: 'd18ec14-201712151300'
+  pDBSnapshotIdentifier:
+    Description: Database snapshot identifier to restore from on instance creation
+    Type: String
+    Default: arn:aws:rds:eu-west-2:847208056990:snapshot:ccrdev-for-lz
+  pAppCertificateArn:
+    Description: Certificate ARN of the TLS certificate for HTTPS listener
+    Type: String
+    Default: arn:aws:acm:eu-west-2:411213865113:certificate/eb22d590-8d59-4221-a5aa-1077b11a122f
+
+
+Resources:
+  AppInfrastructureTemplate:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure_stack.template
+      TimeoutInMinutes: 20
+      Parameters:
+        pAppName: !Ref pAppName
+        pDBSnapshotIdentifier: !Ref pDBSnapshotIdentifier
+
+  AppServiceTemplate:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: application_stack.template
+      TimeoutInMinutes: 20
+      Parameters:
+        pAppName: !Ref pAppName
+        pAppDbEndPoint:
+          !GetAtt
+          - AppInfrastructureTemplate
+          - Outputs.AppDbEndPoint
+        pAppAlbSecurityGroup:
+          !GetAtt
+          - AppInfrastructureTemplate
+          - Outputs.AppAlbSecurityGroup
+        pAppEcsCluster:
+          !GetAtt
+          - AppInfrastructureTemplate
+          - Outputs.AppEcsCluster
+        pECSRepositoryURL: !Ref pECSRepositoryURL
+        pDockerImageTag: !Ref pDockerImageTag
+        pAppCertificateArn: !Ref pAppCertificateArn
+
+Outputs:
+  TemplateType:
+    Value: Standard Multi-Tier Web Application
+  TemplateVersion:
+    Value: 1.0
+
+  LoadBalancerDNSName:
+    Description: LoadBalancer DNS Name
+    Value:
+      !GetAtt
+      - AppServiceTemplate
+      - Outputs.LoadBalancerDNSName
+    Export:
+      Name: !Sub "${pAppName}-LoadBalancerDNSName"
