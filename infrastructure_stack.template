@@ -1,0 +1,250 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: LAA infrastructure stack foundation based on UK OFFICIAL infrastructure template
+Parameters:
+  pAppName:
+    Type: String
+    Default: ''
+    Description: Application name with application instance identifier,
+      e.g. "CCR1" to accommodate multiple instances of the same stack under the same infrastructure
+  pEcsAmiId:
+    Type: String
+    Default: 'ami-dbfee1bf'
+    Description: AMI image to use
+  pEc2InstanceType:
+    Type: String
+    Default: 'm4.large'
+    Description: Instance size for EC2 instances hosting ECS
+  pRdsInstanceType:
+    Type: String
+    Default: 'db.t2.medium'
+    Description: Instance size for RDS database
+  pSshKeyName:
+    Type: String
+    Default: 'development-developer'
+    Description: The EC2 instances SSH key
+  pDBSnapshotIdentifier:
+    Type: String
+    Default: ''
+    Description: Database snapshot identifier to restore from on instance creation
+
+Resources:
+
+################################################################################
+#
+# Security groups
+#
+################################################################################
+
+  AppEcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App ECS Security Group
+      VpcId: !ImportValue "env-VpcId"
+  EcsSecurityGroupSSHinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppEcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: '22'
+      ToPort: '22'
+      CidrIp: 0.0.0.0/0
+  AppAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App ALB Security Group
+      VpcId: !ImportValue "env-VpcId"
+  EcsSecurityGroupALBports:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AppEcsSecurityGroup'
+      IpProtocol: tcp
+      FromPort: '32768'
+      ToPort: '61000'
+      SourceSecurityGroupId: !Ref AppAlbSecurityGroup
+  AlbSecurityGroupHTTPinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AppAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: '80'
+      ToPort: '80'
+      CidrIp: 0.0.0.0/0
+  AlbSecurityGroupHTTPSinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AppAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: '443'
+      ToPort: '443'
+      CidrIp: 0.0.0.0/0
+  AppDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App DB Security Group
+      VpcId: !ImportValue "env-VpcId"
+  DbSecurityGroupSQLNetInbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppDbSecurityGroup
+      IpProtocol: tcp
+      FromPort: '1521'
+      ToPort: '1521'
+      SourceSecurityGroupId: !Ref AppEcsSecurityGroup
+
+  AppBastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App Bastion Security Group
+      VpcId: !ImportValue "env-VpcId"
+  BastionSecurityGroupSSHinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppBastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: '22'
+      ToPort: '22'
+      CidrIp: 0.0.0.0/0
+
+
+################################################################################
+#
+# ECS Infastructure
+#
+################################################################################
+
+  AppEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: app-ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - 'ecs:CreateCluster'
+              - 'ecs:DeregisterContainerInstance'
+              - 'ecs:DiscoverPollEndpoint'
+              - 'ecs:Poll'
+              - 'ecs:RegisterContainerInstance'
+              - 'ecs:StartTelemetrySession'
+              - 'ecs:Submit*'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              - 'ecr:*'
+            Resource: '*'
+  AppEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref AppEc2Role ]
+  AppEcsCluster:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Ref pAppName
+  AppEc2LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref pEcsAmiId
+      SecurityGroups: [ !Ref AppEcsSecurityGroup ]
+      InstanceType: !Ref pEc2InstanceType
+      IamInstanceProfile: !Ref AppEC2InstanceProfile
+      KeyName: !Ref pSshKeyName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo ECS_CLUSTER=${AppEcsCluster} >> /etc/ecs/ecs.config
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+  AppECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 2
+      LaunchConfigurationName: !Ref AppEc2LaunchConfig
+      MaxSize: 10
+      MinSize: 0
+      VPCZoneIdentifier:
+        - !ImportValue 'env-AppPrivateSubnetA'
+        - !ImportValue 'env-AppPrivateSubnetB'
+      Tags:
+        - Key: Keep
+          Value: 'true'
+          PropagateAtLaunch: true
+
+################################################################################
+#
+# Database
+#
+################################################################################
+
+  AppDbSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "All subnets for App VPC"
+      SubnetIds:
+        - !ImportValue env-DBPrivateSubnetA
+        - !ImportValue env-DBPrivateSubnetB
+      Tags:
+        - Key: Keep
+          Value: 'true'
+  AppDbOptionGroup:
+    Type: "AWS::RDS::OptionGroup"
+    Properties: 
+      EngineName: "oracle-se1"
+      MajorEngineVersion: "11.2"
+      OptionGroupDescription: "App DB Options - enables XMLDB"
+      OptionConfigurations:
+        - OptionName: XMLDB
+      Tags:
+        - Key: Keep
+          Value: 'true'
+  AppDb1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 300
+      AutoMinorVersionUpgrade: false
+      BackupRetentionPeriod: 7
+      CharacterSetName: "WE8MSWIN1252"
+      VPCSecurityGroups:
+      - Ref: AppDbSecurityGroup
+      DBInstanceClass: !Ref pRdsInstanceType
+      DBInstanceIdentifier: !Ref pAppName
+      DBName: !Ref pAppName
+      Engine: oracle-se1
+      EngineVersion: "11.2.0.4.v12"
+      MultiAZ: true
+      MasterUsername: admin
+      MasterUserPassword: MySecret
+      LicenseModel: license-included
+      StorageType: gp2
+      DBSubnetGroupName: !Ref AppDbSubnetGroup
+      OptionGroupName: !Ref AppDbOptionGroup
+      DBSnapshotIdentifier: !Ref pDBSnapshotIdentifier
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Keep
+          Value: 'true'
+
+Outputs:
+  AppEcsCluster:
+    Description: The ECS cluster created by the stack
+    Value: !Ref AppEcsCluster
+
+  AppAlbSecurityGroup:
+    Description: Security group used for public load balancers
+    Value: !Ref AppAlbSecurityGroup
+
+  AppDbEndPoint:
+    Description: The DB EndPoint address and port connect string
+    Value:
+      !Sub
+        - ${DbAddress}:${DbPort}
+        - { DbAddress: !GetAtt AppDb1.Endpoint.Address, DbPort: !GetAtt AppDb1.Endpoint.Port }
+  

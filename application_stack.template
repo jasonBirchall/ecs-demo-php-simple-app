@@ -1,0 +1,255 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: LAA Application Load Balancer stack
+Parameters:
+  pAppName:
+    Type: String
+    Default: ''
+  pAppEcsCluster:
+    Type: String
+    Default: ''
+  pECSRepositoryURL:
+    Type: String
+    Default: ''
+  pDockerImageTag:
+    Type: String
+    Default: ''
+  pAppDbEndPoint:
+    Type: String
+    Default: ''
+  pAppAlbSecurityGroup:
+    Type: String
+    Default: ''
+  pAppCertificateArn:
+    Type: String
+    Default: ''
+
+Resources:
+
+################################################################################
+#
+# App container setup and ALB
+#
+################################################################################
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbHTTPListener
+    Properties:
+      Cluster: !Ref pAppEcsCluster
+      DesiredCount: '2'
+      LoadBalancers:
+        - ContainerName: !Ref pAppName
+          ContainerPort: '8080'
+          TargetGroupArn: !Ref 'TargetGroup'
+      Role: !Ref 'EcsServiceRole'
+      TaskDefinition: !Ref 'TaskDefinition'
+  EcsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ecs.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub '${pAppName}-ecs-service'
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:RegisterTargets'
+                  - 'ec2:Describe*'
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                Resource: '*'
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: EcsService
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 2
+      ResourceId: !Join ['', [service/, !Ref pAppEcsCluster, /, !GetAtt EcsService.Name]]
+      RoleARN: !GetAtt AutoscalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: AStepPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref 'ServiceScalingTarget'
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 200
+  ALB500sAlarmScaleUp:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: '1'
+      Statistic: Average
+      Threshold: '10'
+      AlarmDescription: Alarm if our ALB generates too many HTTP 500s.
+      Period: '60'
+      AlarmActions: [!Ref 'ServiceScalingPolicy']
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - Name: EcsService
+          Value: !Ref EcsService
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: HTTPCode_ELB_5XX_Count
+  AlbHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: EcsServiceRole
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'TargetGroup'
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: '80'
+      Protocol: HTTP
+  AlbHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: EcsServiceRole
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref pAppCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'TargetGroup'
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: '443'
+      Protocol: HTTPS
+  EcsAlbHTTPListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: AlbHTTPListener
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'TargetGroup'
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref 'AlbHTTPListener'
+      Priority: 1
+  EcsAlbHTTPSListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: AlbHTTPSListener
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'TargetGroup'
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref 'AlbHTTPSListener'
+      Priority: 1
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: LoadBalancer
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Sub '${pAppName}-TargetGroup'
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 10
+      VpcId: !ImportValue 'env-VpcId'
+      TargetGroupAttributes:
+        - Key: 'stickiness.enabled'
+          Value: 'true'
+        - Key: 'stickiness.type'
+          Value: 'lb_cookie'
+        - Key: 'stickiness.lb_cookie.duration_seconds'
+          Value: '10800' # 3 hours in seconds
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${pAppName}-LoadBalancer'
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+      Subnets: [ !ImportValue env-DMZSubnetA, !ImportValue env-DMZSubnetB ]
+      SecurityGroups:
+        - !Ref 'pAppAlbSecurityGroup'
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join [ '', [ !Ref pAppName, '-app' ] ]
+      ContainerDefinitions:
+        - Name: !Ref pAppName
+          Cpu: '2048'
+          Essential: 'true'
+          Image: !Join [':', [!Ref pECSRepositoryURL, !Ref pDockerImageTag ]]
+          Memory: '2000'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'CloudwatchLogsGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: !Sub '${pAppName}-app'
+          PortMappings:
+            - ContainerPort: '8080'
+          Environment:
+            - Name: CCR_DB_URL
+              Value: !Sub "jdbc:oracle:thin:@${pAppDbEndPoint}:${pAppName}"
+            - Name: CCR_DB_USERID
+              Value: cclfdata
+            - Name: CCR_DB_PASSWORD
+              Value: cclfd4t4
+            - Name: CCR_DB_POOL_MAX_CONNECTION
+              Value: 20
+            - Name: CCR_APP_LOG_LEVEL
+              Value: debug
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '${pAppName}-ECS'
+      RetentionInDays: 14
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'application-autoscaling.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'application-autoscaling:*'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:UpdateService'
+                Resource: '*'
+
+Outputs:
+  EcsService:
+    Value: !Ref EcsService
+  LoadBalancerDNSName:
+    Description: Your ALB DNS URL
+    Value: !GetAtt LoadBalancer.DNSName
+  taskdef:
+    Value: !Ref 'TaskDefinition'
